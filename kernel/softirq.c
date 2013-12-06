@@ -76,6 +76,7 @@ static void wakeup_softirqd(void)
 	if (tsk && tsk->state != TASK_RUNNING)
 		wake_up_process(tsk);
 }
+EXPORT_SYMBOL(wakeup_softirqd);
 
 /*
  * preempt_count and SOFTIRQ_OFFSET usage:

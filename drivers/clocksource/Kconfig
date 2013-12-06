@@ -69,6 +69,7 @@ config ARM_ARCH_TIMER
 
 config ARM_GLOBAL_TIMER
 	bool
+	default y
 	select CLKSRC_OF if OF
 	help
 	  This options enables support for the ARM global timer unit

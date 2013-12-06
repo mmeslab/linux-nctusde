@@ -522,6 +522,9 @@ struct sk_buff {
 				*data;
 	unsigned int		truesize;
 	atomic_t		users;
+	
+	// NCTUSS
+	void * nctuss_data;
 };
 
 #ifdef __KERNEL__

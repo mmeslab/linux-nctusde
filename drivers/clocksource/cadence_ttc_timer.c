@@ -23,7 +23,10 @@
 #include <linux/slab.h>
 #include <linux/clk-provider.h>
 
-#include <asm/sched_clock.h>
+#include <linux/sched_clock.h>
+
+#include <linux/hrtimer.h> // NCTUSS
+#include <linux/tick.h>
 
 /*
  * This driver configures the 2 16-bit count-up timers as follows:
@@ -220,6 +223,56 @@ static void ttc_set_mode(enum clock_event_mode mode,
 		break;
 	}
 }
+
+/*
+NCTUSS
+*/
+static void nctuss_ttc_stop(void)
+{
+	struct tick_device *td;
+	struct clock_event_device *evt;
+	struct ttc_timer_clockevent *ttce;
+	struct ttc_timer *timer;
+	u32 ctrl_reg;
+	
+	//td = &__get_cpu_var(tick_cpu_device);
+	td = tick_get_broadcast_device();
+	evt = td->evtdev;
+
+	ttce = to_ttc_timer_clkevent(evt);
+
+	timer = &ttce->ttc;
+
+	ctrl_reg = __raw_readl(timer->base_addr +
+				TTC_CNT_CNTRL_OFFSET);
+	ctrl_reg |= TTC_CNT_CNTRL_DISABLE_MASK;
+	__raw_writel(ctrl_reg,
+			timer->base_addr + TTC_CNT_CNTRL_OFFSET);
+}
+EXPORT_SYMBOL(nctuss_ttc_stop);
+static void nctuss_ttc_resume(void)
+{
+	struct tick_device *td;
+	struct clock_event_device *evt;
+	struct ttc_timer_clockevent *ttce;
+	struct ttc_timer *timer;
+	u32 ctrl_reg;
+	
+	//td = &__get_cpu_var(tick_cpu_device);
+	td = tick_get_broadcast_device();
+	evt = td->evtdev;
+
+	ttce = to_ttc_timer_clkevent(evt);
+
+	timer = &ttce->ttc;
+
+	ctrl_reg = __raw_readl(timer->base_addr +
+				TTC_CNT_CNTRL_OFFSET);
+	ctrl_reg &= ~TTC_CNT_CNTRL_DISABLE_MASK;
+	__raw_writel(ctrl_reg,
+			timer->base_addr + TTC_CNT_CNTRL_OFFSET);
+}
+EXPORT_SYMBOL(nctuss_ttc_resume);
 
 static int ttc_rate_change_clocksource_cb(struct notifier_block *nb,
 		unsigned long event, void *data)

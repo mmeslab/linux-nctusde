@@ -19,18 +19,23 @@
 #define GIC_CPU_HIGHPRI			0x18
 
 #define GIC_DIST_CTRL			0x000
+/* GIC_DIST_CTR =  Interrupt Controller Type Register (ICDICTR) */
 #define GIC_DIST_CTR			0x004
 #define GIC_DIST_IGROUP			0x080
+#define NCTUSS_GIC_DIST_ICDISR0		0x080 /*  Interrupt Security Register 0  */
 #define GIC_DIST_ENABLE_SET		0x100
 #define GIC_DIST_ENABLE_CLEAR		0x180
 #define GIC_DIST_PENDING_SET		0x200
 #define GIC_DIST_PENDING_CLEAR		0x280
 #define GIC_DIST_ACTIVE_SET		0x300
 #define GIC_DIST_ACTIVE_CLEAR		0x380
+/* GIC_DIST_PIR =  Interrupt Priority Registers (ICDIPRn) */
 #define GIC_DIST_PRI			0x400
 #define GIC_DIST_TARGET			0x800
 #define GIC_DIST_CONFIG			0xc00
+/* GIC_DIST_SOFTINT = ICDSGIR */
 #define GIC_DIST_SOFTINT		0xf00
+
 
 #define GICH_HCR			0x0
 #define GICH_VTR			0x4

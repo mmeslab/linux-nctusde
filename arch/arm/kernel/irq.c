@@ -66,6 +66,8 @@ void handle_IRQ(unsigned int irq, struct pt_regs *regs)
 {
 	struct pt_regs *old_regs = set_irq_regs(regs);
 
+	////printk(KERN_ALERT "asm_do_IRQ. irq=%d\n", irq); // NCTUSS
+
 	irq_enter();
 
 	/*

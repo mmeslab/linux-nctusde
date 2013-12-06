@@ -41,6 +41,8 @@
 #define GT_COMP1	0x14
 #define GT_AUTO_INC	0x18
 
+#define NCTUSS
+
 /*
  * We are expecting to be clocked by the ARM peripheral clock.
  *
@@ -71,13 +73,26 @@ static u64 gt_counter_read(void)
 		old_upper = upper;
 		lower = readl_relaxed(gt_base + GT_COUNTER0);
 		upper = readl_relaxed(gt_base + GT_COUNTER1);
-	} while (upper != old_upper);
+	} while (unlikely(upper != old_upper));
 
 	counter = upper;
 	counter <<= 32;
 	counter |= lower;
 	return counter;
 }
+
+#ifdef NCTUSS
+//TODO: move to our own file...
+static volatile u32 nctuss_OS_paused = 0;
+static volatile u32 nctuss_OS_paused_counter_count;
+EXPORT_SYMBOL(nctuss_OS_paused);
+EXPORT_SYMBOL(nctuss_OS_paused_counter_count);
+
+DEFINE_SPINLOCK(nctuss_gt_spinlock);
+EXPORT_SYMBOL(nctuss_gt_spinlock);
+
+#endif
+
 
 /**
  * To ensure that updates to comparator value register do not set the
@@ -91,10 +106,27 @@ static void gt_compare_set(unsigned long delta, int periodic)
 {
 	u64 counter = gt_counter_read();
 	unsigned long ctrl;
+#ifdef NCTUSS
+	unsigned long flags;
+#endif
 
 	counter += delta;
+#ifdef NCTUSS
+	// If we have stopped the global counter, then don't let timer re-enable it.
+	spin_lock_irqsave(&nctuss_gt_spinlock, flags);
+	if(nctuss_OS_paused==1) {
+		ctrl = 0;
+	}
+	else {
+		ctrl = GT_CONTROL_TIMER_ENABLE;
+	}
+	
+#else
 	ctrl = GT_CONTROL_TIMER_ENABLE;
+
+#endif
 	writel(ctrl, gt_base + GT_CONTROL);
+
 	writel(lower_32_bits(counter), gt_base + GT_COMP0);
 	writel(upper_32_bits(counter), gt_base + GT_COMP1);
 
@@ -105,6 +137,10 @@ static void gt_compare_set(unsigned long delta, int periodic)
 
 	ctrl |= GT_CONTROL_COMP_ENABLE | GT_CONTROL_IRQ_ENABLE;
 	writel(ctrl, gt_base + GT_CONTROL);
+
+#ifdef NCTUSS
+	spin_unlock_irqrestore(&nctuss_gt_spinlock, flags);
+#endif
 }
 
 static void gt_clockevent_set_mode(enum clock_event_mode mode,
@@ -128,6 +164,56 @@ static void gt_clockevent_set_mode(enum clock_event_mode mode,
 		break;
 	}
 }
+
+/*
+NCTUSS
+*/
+static void nctuss_gt_stop(void)
+{
+	unsigned long ctrl;
+	ctrl = readl(gt_base + GT_CONTROL);
+	ctrl &= ~(GT_CONTROL_TIMER_ENABLE);
+	writel(ctrl, gt_base + GT_CONTROL);
+}
+EXPORT_SYMBOL(nctuss_gt_stop);
+static void nctuss_gt_resume(void)
+{
+	unsigned long ctrl;
+	ctrl = readl(gt_base + GT_CONTROL);
+	ctrl |= (GT_CONTROL_TIMER_ENABLE);
+	writel(ctrl, gt_base + GT_CONTROL);
+}
+EXPORT_SYMBOL(nctuss_gt_resume);
+static void* nctuss_gt_get_gt_counter_base(void)
+{
+	return gt_base + GT_COUNTER0;
+}
+EXPORT_SYMBOL(nctuss_gt_get_gt_counter_base);
+static u32 nctuss_gt_get_counter_value(void)
+{
+	return readl_relaxed(gt_base + GT_COUNTER0);
+}
+EXPORT_SYMBOL(nctuss_gt_get_counter_value);
+
+
+// 
+
+static void __iomem *nctuss_my_ipi_base;
+static void nctuss_my_ipi_base_register(void)
+{
+	printk(KERN_ALERT "nctuss_my_ipi_base_register\n");
+	nctuss_my_ipi_base = ioremap_nocache(0x6A000000, 0xFFFF);
+	
+}
+static void * nctuss_get_my_ipi_base(void) {
+	return nctuss_my_ipi_base;
+}
+EXPORT_SYMBOL(nctuss_get_my_ipi_base);
+
+// END NCTUSS
+
+
+
 
 static int gt_clockevent_set_next_event(unsigned long evt,
 					struct clock_event_device *unused)
@@ -174,7 +260,8 @@ static int __cpuinit gt_clockevents_init(struct clock_event_device *clk)
 	clk->set_mode = gt_clockevent_set_mode;
 	clk->set_next_event = gt_clockevent_set_next_event;
 	clk->cpumask = cpumask_of(cpu);
-	clk->rating = 300;
+	clk->rating = 400;
+	////clk->rating = 300;
 	clk->irq = gt_ppi;
 	clockevents_config_and_register(clk, gt_clk_rate,
 					1, 0xffffffff);
@@ -210,6 +297,8 @@ static u32 notrace gt_sched_clock_read(void)
 
 static void __init gt_clocksource_init(void)
 {
+	printk(KERN_ALERT "gt_clocksource_init!!!");
+	
 	writel(0, gt_base + GT_CONTROL);
 	writel(0, gt_base + GT_COUNTER0);
 	writel(0, gt_base + GT_COUNTER1);
@@ -245,6 +334,12 @@ static void __init global_timer_of_register(struct device_node *np)
 	struct clk *gt_clk;
 	int err = 0;
 
+	printk(KERN_ALERT "ARM_GLOBAL_TIMER: global_timer_of_register\n");
+
+	//NCTUSS
+	// TODO: borrow here to call nctuss_my_ipi_base_register(). Need to move to our own place.
+	nctuss_my_ipi_base_register();
+
 	/*
 	 * In r2p0 the comparators for each processor with the global timer
 	 * fire when the timer value is greater than or equal to. In previous
@@ -279,6 +374,9 @@ static void __init global_timer_of_register(struct device_node *np)
 	}
 
 	gt_clk_rate = clk_get_rate(gt_clk);
+	// NCTUSS
+	printk(KERN_ALERT "arm_global_timer: gt_clk_rate =%lu\n", gt_clk_rate);
+	
 	gt_evt = alloc_percpu(struct clock_event_device);
 	if (!gt_evt) {
 		pr_warn("global-timer: can't allocate memory\n");
@@ -294,6 +392,8 @@ static void __init global_timer_of_register(struct device_node *np)
 		goto out_free;
 	}
 
+
+// NCTUSS
 	err = register_cpu_notifier(&gt_cpu_nb);
 	if (err) {
 		pr_warn("global-timer: unable to register cpu notifier.\n");
@@ -302,7 +402,7 @@ static void __init global_timer_of_register(struct device_node *np)
 
 	/* Immediately configure the timer on the boot CPU */
 	gt_clocksource_init();
-	gt_clockevents_init(this_cpu_ptr(gt_evt));
+	gt_clockevents_init(this_cpu_ptr(gt_evt)); // NCTUSS
 
 	return;
 

@@ -320,6 +320,46 @@ static void l2x0_unlock(u32 cache_id)
 	}
 }
 
+static void nctuss_l2x0_unlock(void)
+{
+	u32 cache_id;
+
+	cache_id = readl_relaxed(l2x0_base + L2X0_CACHE_ID);
+	l2x0_unlock(cache_id);
+}
+EXPORT_SYMBOL(nctuss_l2x0_unlock); // NCTUSS
+
+static void nctuss_l2x0_lock(void)
+{
+	int lockregs;
+	int i;
+	u32 cache_id;
+
+	cache_id = readl_relaxed(l2x0_base + L2X0_CACHE_ID);	
+
+	switch (cache_id & L2X0_CACHE_ID_PART_MASK) {
+	case L2X0_CACHE_ID_PART_L310:
+		lockregs = 8;
+		break;
+	case AURORA_CACHE_ID:
+		lockregs = 4;
+		break;
+	default:
+		/* L210 and unknown types */
+		lockregs = 1;
+		break;
+	}
+
+	for (i = 0; i < lockregs; i++) {
+		writel_relaxed(0xFE, l2x0_base + L2X0_LOCKDOWN_WAY_D_BASE +
+			       i * L2X0_LOCKDOWN_STRIDE);
+		writel_relaxed(0xFE, l2x0_base + L2X0_LOCKDOWN_WAY_I_BASE +
+			       i * L2X0_LOCKDOWN_STRIDE);
+	}
+}
+EXPORT_SYMBOL(nctuss_l2x0_lock);
+
+
 void __init l2x0_init(void __iomem *base, u32 aux_val, u32 aux_mask)
 {
 	u32 aux;

@@ -17,6 +17,9 @@
  *    support is added in and set MAX_MTU to 9000.
  */
 
+#define NCTUSS 1
+#define NCTUSS_USE_MEMORY_BUFFER 1
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -42,6 +45,13 @@
 #include <linux/of_address.h>
 #include <linux/of_mdio.h>
 #include <linux/timer.h>
+
+#ifdef NCTUSS
+#include <linux/udp.h>
+#include <linux/ip.h>
+#include <linux/if_ether.h>
+#include <linux/skbuff.h>
+#endif
 
 /************************** Constant Definitions *****************************/
 
@@ -80,8 +90,8 @@ MDC_DIV_64, MDC_DIV_96, MDC_DIV_128, MDC_DIV_224 };
 #undef  DEBUG
 #define DEBUG
 
-#define XEMACPS_SEND_BD_CNT		256
-#define XEMACPS_RECV_BD_CNT		256
+#define XEMACPS_SEND_BD_CNT		128
+#define XEMACPS_RECV_BD_CNT		128
 
 #define XEMACPS_NAPI_WEIGHT		64
 
@@ -473,6 +483,72 @@ MDC_DIV_64, MDC_DIV_96, MDC_DIV_128, MDC_DIV_224 };
 #define xemacps_write(base, reg, val)					\
 	__raw_writel((val), ((void __iomem *)(base)) + (reg))
 
+#ifdef NCTUSS
+struct nctuss_skb_wrapper {
+	char *data_virt;
+	char *data_phy;
+	
+	struct sk_buff *skb;
+	struct sk_buff skb_clone; // a clone of the modified skb (data pointing to ioremapped memory)
+	unsigned char *ori_skb_data; // the original pointer of the skb. need to change back when returning the skb to kernel.
+	struct list_head list;
+};
+
+/* 256 = MAX_SECTOR_NUM, 8 = SSD channels. */
+#define NCTUSS_SKB_POOL_SIZE (512 * 8 + XEMACPS_RECV_BD_CNT) 
+static struct nctuss_skb_wrapper nctuss_skb_pool[NCTUSS_SKB_POOL_SIZE]; 
+
+static struct list_head nctuss_skb_free_list;
+
+//#define NCTUSS_DEBUG_LOST_SKB
+
+#ifdef NCTUSS_DEBUG_LOST_SKB
+static int nctuss_skb_pool_used_count = 0;
+static int nctuss_skb_pool_used_count_max = 0;
+#endif
+
+static struct sk_buff * nctuss_skb_pool_get(void)
+{
+	struct nctuss_skb_wrapper *skbw;
+
+	if(list_empty(&nctuss_skb_free_list)) {
+		printk(KERN_ALERT "nctuss_skb_pool_get: nctuss_skb_free_list is empty!\n");
+		while(1);
+	}
+	skbw = (struct nctuss_skb_wrapper *)list_entry(nctuss_skb_free_list.next, struct nctuss_skb_wrapper, list);
+	list_del(&(skbw->list));
+
+#ifdef NCTUSS_DEBUG_LOST_SKB	
+	nctuss_skb_pool_used_count++;
+	if(nctuss_skb_pool_used_count > nctuss_skb_pool_used_count_max) {
+		nctuss_skb_pool_used_count_max = nctuss_skb_pool_used_count;
+		printk(KERN_ALERT "nctuss_skb_pool_get: nctuss_skb_pool_used_count_max=%d\n", nctuss_skb_pool_used_count_max);
+	}
+#endif
+	
+	return skbw->skb;
+}
+
+static void nctuss_skb_pool_return(struct sk_buff *skb)
+{
+	struct nctuss_skb_wrapper *skbw = (struct nctuss_skb_wrapper *)skb->nctuss_data;
+
+	*(skbw->skb) = skbw->skb_clone;
+	list_add(&(skbw->list), &nctuss_skb_free_list);
+
+#ifdef NCTUSS_DEBUG_LOST_SKB
+	nctuss_skb_pool_used_count--;
+#endif
+}
+
+static void nctuss_xemacps_return_skb(struct sk_buff *skb)
+{
+	nctuss_skb_pool_return(skb);
+}
+EXPORT_SYMBOL(nctuss_xemacps_return_skb);
+
+#endif
+
 struct ring_info {
 	struct sk_buff *skb;
 	dma_addr_t mapping;
@@ -549,6 +625,7 @@ struct net_local {
 		clk_rate_change_nb)
 
 static struct net_device_ops netdev_ops;
+
 
 /**
  * xemacps_mdio_read - Read current value of phy register indicated by
@@ -1148,6 +1225,7 @@ static int xemacps_rx(struct net_local *lp, int budget)
 #endif /* CONFIG_XILINX_PS_EMAC_HWTSTAMP */
 		size += len;
 		packets++;
+
 		netif_receive_skb(skb);
 
 		cur_p->addr = (cur_p->addr & ~XEMACPS_RXBUF_ADD_MASK)
@@ -1170,8 +1248,130 @@ static int xemacps_rx(struct net_local *lp, int budget)
 	wmb();
 	lp->stats.rx_packets += packets;
 	lp->stats.rx_bytes += size;
+
 	return numbdfree;
 }
+
+#ifdef NCTUSS
+static void (*nctuss_emacps_receive_skb_hook)(struct sk_buff *skb) = NULL;
+static int nctuss_xemacps_rx(struct net_local *lp, int budget)
+{
+	struct xemacps_bd *cur_p;
+	u32 len;
+	struct sk_buff *skb;
+	struct sk_buff *new_skb;
+	u32 new_skb_baddr;
+	unsigned int numbdfree = 0;
+	u32 size = 0;
+	u32 packets = 0;
+	u32 regval;
+
+	cur_p = &lp->rx_bd[lp->rx_bd_ci];
+	regval = cur_p->addr;
+	rmb();
+	while (numbdfree < budget) {
+		if (!(regval & XEMACPS_RXBUF_NEW_MASK))
+			break;
+
+		////printk(KERN_ALERT "nctuss_xemacps_rx: lp->rx_bd_ci=%d\n", lp->rx_bd_ci);
+
+		new_skb = nctuss_skb_pool_get();
+		new_skb_baddr = ((struct nctuss_skb_wrapper*)new_skb->nctuss_data)->data_phy;
+/*
+		new_skb = netdev_alloc_skb(lp->ndev, XEMACPS_RX_BUF_SIZE);
+		if (new_skb == NULL) {
+			dev_err(&lp->ndev->dev, "no memory for new sk_buff\n");
+			break;
+		}
+*/
+		/* Get dma handle of skb->data */
+/*		
+		new_skb_baddr = (u32) dma_map_single(lp->ndev->dev.parent,
+					new_skb->data,
+					XEMACPS_RX_BUF_SIZE,
+					DMA_FROM_DEVICE);
+*/
+		/* the packet length */
+		len = cur_p->ctrl & XEMACPS_RXBUF_LEN_MASK;
+		rmb();
+		
+		skb = lp->rx_skb[lp->rx_bd_ci].skb;
+		/*
+		dma_unmap_single(lp->ndev->dev.parent,
+				lp->rx_skb[lp->rx_bd_ci].mapping,
+				lp->rx_skb[lp->rx_bd_ci].len,
+				DMA_FROM_DEVICE);
+		*/
+#ifndef NCTUSS_USE_MEMORY_BUFFER
+		dma_sync_single_for_cpu(lp->ndev->dev.parent, lp->rx_skb[lp->rx_bd_ci].mapping, len, DMA_FROM_DEVICE);
+#endif
+
+		/* setup received skb and send it upstream */
+		skb_put(skb, len);  /* Tell the skb how much data we got. */
+		skb->protocol = eth_type_trans(skb, lp->ndev);
+
+		skb->ip_summed = lp->ip_summed;
+
+#ifdef CONFIG_XILINX_PS_EMAC_HWTSTAMP
+		if ((lp->hwtstamp_config.rx_filter == HWTSTAMP_FILTER_ALL) &&
+		    (ntohs(skb->protocol) == 0x800)) {
+			unsigned ip_proto, dest_port, msg_type;
+
+			/* While the GEM can timestamp PTP packets, it does
+			 * not mark the RX descriptor to identify them.  This
+			 * is entirely the wrong place to be parsing UDP
+			 * headers, but some minimal effort must be made.
+			 * NOTE: the below parsing of ip_proto and dest_port
+			 * depend on the use of Ethernet_II encapsulation,
+			 * IPv4 without any options.
+			 */
+			ip_proto = *((u8 *)skb->mac_header + 14 + 9);
+			dest_port = ntohs(*(((u16 *)skb->mac_header) +
+						((14 + 20 + 2)/2)));
+			msg_type = *((u8 *)skb->mac_header + 42);
+			if ((ip_proto == IPPROTO_UDP) &&
+			    (dest_port == 0x13F)) {
+				/* Timestamp this packet */
+				xemacps_rx_hwtstamp(lp, skb, msg_type & 0x2);
+			}
+		}
+#endif /* CONFIG_XILINX_PS_EMAC_HWTSTAMP */
+		size += len;
+		packets++;
+		
+		if(nctuss_emacps_receive_skb_hook!=NULL) {
+			nctuss_emacps_receive_skb_hook(skb);
+		}
+		
+
+		cur_p->addr = (cur_p->addr & ~XEMACPS_RXBUF_ADD_MASK)
+					| (new_skb_baddr);
+
+		
+		lp->rx_skb[lp->rx_bd_ci].skb = new_skb;
+		lp->rx_skb[lp->rx_bd_ci].mapping = new_skb_baddr;
+		lp->rx_skb[lp->rx_bd_ci].len = XEMACPS_RX_BUF_SIZE;
+
+
+		cur_p->ctrl = 0;
+		cur_p->addr &= (~XEMACPS_RXBUF_NEW_MASK);
+		wmb();
+
+		lp->rx_bd_ci++;
+		lp->rx_bd_ci = lp->rx_bd_ci % XEMACPS_RECV_BD_CNT;
+		cur_p = &lp->rx_bd[lp->rx_bd_ci];
+		regval = cur_p->addr;
+		rmb();
+		numbdfree++;
+	}
+	wmb();
+	lp->stats.rx_packets += packets;
+	lp->stats.rx_bytes += size;
+
+	return numbdfree;
+}
+
+#endif
 
 /**
  * xemacps_rx_poll - NAPI poll routine
@@ -1217,6 +1417,7 @@ static int xemacps_rx_poll(struct napi_struct *napi, int budget)
 	spin_unlock(&lp->rx_lock);
 	return work_done;
 }
+
 
 /**
  * xemacps_tx_poll - tx bd reclaim tasklet handler
@@ -1337,12 +1538,148 @@ static void xemacps_tx_poll(unsigned long data)
 		xemacps_write(lp->baseaddr, XEMACPS_NWCTRL_OFFSET, regval);
 		spin_unlock_irqrestore(&lp->nwctrlreg_lock, flags);
 	}
-
+	
 	netif_wake_queue(ndev);
 
 tx_poll_out:
 	spin_unlock(&lp->tx_lock);
+
 }
+
+#ifdef NCTUSS
+/*
+Our version of tx_poll. No lockings needed at all. And do NOT enable irq or bh.
+*/
+static void nctuss_xemacps_tx_poll(unsigned long data)
+{
+	struct net_device *ndev = (struct net_device *)data;
+	struct net_local *lp = netdev_priv(ndev);
+	u32 regval;
+	u32 len = 0;
+	unsigned int bdcount = 0;
+	unsigned int bdpartialcount = 0;
+	unsigned int sop = 0;
+	struct xemacps_bd *cur_p;
+	u32 cur_i;
+	u32 numbdstofree;
+	u32 numbdsinhw;
+	struct ring_info *rp;
+	struct sk_buff *skb;
+	unsigned long flags;
+
+	////spin_lock(&lp->tx_lock);
+	regval = xemacps_read(lp->baseaddr, XEMACPS_TXSR_OFFSET);
+	xemacps_write(lp->baseaddr, XEMACPS_TXSR_OFFSET, regval);
+	////dev_dbg(&lp->pdev->dev, "TX status 0x%x\n", regval);
+	if (regval & (XEMACPS_TXSR_HRESPNOK_MASK | XEMACPS_TXSR_BUFEXH_MASK)) {
+		////dev_err(&lp->pdev->dev, "TX error 0x%x\n", regval);
+		printk(KERN_ALERT "nctuss_xemacps_tx_poll: TX error 0x%x\n", regval);
+	}
+
+	cur_i = lp->tx_bd_ci;
+	cur_p = &lp->tx_bd[cur_i];
+	numbdsinhw = XEMACPS_SEND_BD_CNT - lp->tx_bd_freecnt;
+	while (bdcount < numbdsinhw) {
+		if (sop == 0) {
+			if (cur_p->ctrl & XEMACPS_TXBUF_USED_MASK)
+				sop = 1;
+			else
+				break;
+		}
+
+		bdcount++;
+		bdpartialcount++;
+
+		/* hardware has processed this BD so check the "last" bit.
+		 * If it is clear, then there are more BDs for the current
+		 * packet. Keep a count of these partial packet BDs.
+		 */
+		if (cur_p->ctrl & XEMACPS_TXBUF_LAST_MASK) {
+			sop = 0;
+			bdpartialcount = 0;
+		}
+
+		cur_i++;
+		cur_i = cur_i % XEMACPS_SEND_BD_CNT;
+		cur_p = &lp->tx_bd[cur_i];
+	}
+	numbdstofree = bdcount - bdpartialcount;
+	lp->tx_bd_freecnt += numbdstofree;
+	numbdsinhw -= numbdstofree;
+	if (!numbdstofree)
+		goto tx_poll_out;
+
+	cur_p = &lp->tx_bd[lp->tx_bd_ci];
+	while (numbdstofree) {
+		rp = &lp->tx_skb[lp->tx_bd_ci];
+		skb = rp->skb;
+
+		len += (cur_p->ctrl & XEMACPS_TXBUF_LEN_MASK);
+
+#ifdef CONFIG_XILINX_PS_EMAC_HWTSTAMP
+		if ((lp->hwtstamp_config.tx_type == HWTSTAMP_TX_ON) &&
+			(ntohs(skb->protocol) == 0x800)) {
+			unsigned ip_proto, dest_port, msg_type;
+
+			skb_reset_mac_header(skb);
+
+			ip_proto = *((u8 *)skb->mac_header + 14 + 9);
+			dest_port = ntohs(*(((u16 *)skb->mac_header) +
+					((14 + 20 + 2)/2)));
+			msg_type = *((u8 *)skb->mac_header + 42);
+			if ((ip_proto == IPPROTO_UDP) &&
+				(dest_port == 0x13F)) {
+				/* Timestamp this packet */
+				xemacps_tx_hwtstamp(lp, skb, msg_type & 0x2);
+			}
+		}
+#endif /* CONFIG_XILINX_PS_EMAC_HWTSTAMP */
+
+/*
+		dma_unmap_single(&lp->pdev->dev, rp->mapping, rp->len,
+			DMA_TO_DEVICE);
+		rp->skb = NULL;
+		dev_kfree_skb(skb);
+*/
+		///nctuss_skb_pool_return(skb); // The user space program is responsible for returning the skb.
+
+
+		/* log tx completed packets and bytes, errors logs
+		 * are in other error counters.
+		 */
+		if (cur_p->ctrl & XEMACPS_TXBUF_LAST_MASK) {
+			lp->stats.tx_packets++;
+			lp->stats.tx_bytes += len;
+			len = 0;
+		}
+
+		/* Set used bit, preserve wrap bit; clear everything else. */
+		cur_p->ctrl |= XEMACPS_TXBUF_USED_MASK;
+		cur_p->ctrl &= (XEMACPS_TXBUF_USED_MASK |
+					XEMACPS_TXBUF_WRAP_MASK);
+
+		lp->tx_bd_ci++;
+		lp->tx_bd_ci = lp->tx_bd_ci % XEMACPS_SEND_BD_CNT;
+		cur_p = &lp->tx_bd[lp->tx_bd_ci];
+		numbdstofree--;
+	}
+	wmb();
+
+	if (numbdsinhw) {
+		////spin_lock_irqsave(&lp->nwctrlreg_lock, flags);
+		regval = xemacps_read(lp->baseaddr, XEMACPS_NWCTRL_OFFSET);
+		regval |= XEMACPS_NWCTRL_STARTTX_MASK;
+		xemacps_write(lp->baseaddr, XEMACPS_NWCTRL_OFFSET, regval);
+		////spin_unlock_irqrestore(&lp->nwctrlreg_lock, flags);
+	}
+	
+	////netif_wake_queue(ndev);
+
+tx_poll_out:
+	////spin_unlock(&lp->tx_lock);
+	return;
+}
+#endif
 
 /**
  * xemacps_interrupt - interrupt main service routine
@@ -1399,6 +1736,7 @@ static void xemacps_clean_rings(struct net_local *lp)
 	int i;
 
 	for (i = 0; i < XEMACPS_RECV_BD_CNT; i++) {
+
 		if (lp->rx_skb && lp->rx_skb[i].skb) {
 			dma_unmap_single(lp->ndev->dev.parent,
 					 lp->rx_skb[i].mapping,
@@ -1408,6 +1746,7 @@ static void xemacps_clean_rings(struct net_local *lp)
 			dev_kfree_skb(lp->rx_skb[i].skb);
 			lp->rx_skb[i].skb = NULL;
 			lp->rx_skb[i].mapping = 0;
+
 		}
 	}
 
@@ -1421,9 +1760,56 @@ static void xemacps_clean_rings(struct net_local *lp)
 			dev_kfree_skb(lp->tx_skb[i].skb);
 			lp->tx_skb[i].skb = NULL;
 			lp->tx_skb[i].mapping = 0;
+
 		}
 	}
 }
+#ifdef NCTUSS
+static void nctuss_xemacps_clean_rings(struct net_local *lp)
+{
+	int i;
+
+	for (i = 0; i < XEMACPS_RECV_BD_CNT; i++) {
+
+		if (lp->rx_skb && lp->rx_skb[i].skb) {
+#ifdef NCTUSS_USE_MEMORY_BUFFER
+			////lp->rx_skb[i].skb->data = lp->rx_skb[i].ori_skb_data;
+			// TODO: free skbs
+#else
+			dma_unmap_single(lp->ndev->dev.parent,
+					 lp->rx_skb[i].mapping,
+					 lp->rx_skb[i].len,
+					 DMA_FROM_DEVICE);
+
+			dev_kfree_skb(lp->rx_skb[i].skb);
+			lp->rx_skb[i].skb = NULL;
+			lp->rx_skb[i].mapping = 0;
+#endif
+		}
+	}
+
+	// TODO:  if tx allocated by us, then the length is XEMACPS_RX_BUF_SIZE
+
+	for (i = 0; i < XEMACPS_SEND_BD_CNT; i++) {
+		if (lp->tx_skb && lp->tx_skb[i].skb) {
+#ifdef NCTUSS_USE_MEMORY_BUFFER
+			////lp->tx_skb[i].skb->data = lp->tx_skb[i].ori_skb_data;
+			// TODO: free skbs
+#else
+			dma_unmap_single(lp->ndev->dev.parent,
+					 lp->tx_skb[i].mapping,
+					 lp->tx_skb[i].len,
+					 DMA_TO_DEVICE);
+
+			dev_kfree_skb(lp->tx_skb[i].skb);
+			lp->tx_skb[i].skb = NULL;
+			lp->tx_skb[i].mapping = 0;
+#endif
+		}
+	}
+}
+
+#endif
 
 /**
  * xemacps_descriptor_free - Free allocated TX and RX BDs
@@ -1455,6 +1841,36 @@ static void xemacps_descriptor_free(struct net_local *lp)
 		lp->tx_bd = NULL;
 	}
 }
+
+#ifdef NCTUSS
+static void nctuss_xemacps_descriptor_free(struct net_local *lp)
+{
+	int size;
+
+	nctuss_xemacps_clean_rings(lp);
+
+	/* kfree(NULL) is safe, no need to check here */
+	kfree(lp->tx_skb);
+	lp->tx_skb = NULL;
+	kfree(lp->rx_skb);
+	lp->rx_skb = NULL;
+
+	size = XEMACPS_RECV_BD_CNT * sizeof(struct xemacps_bd);
+	if (lp->rx_bd) {
+		dma_free_coherent(&lp->pdev->dev, size,
+			lp->rx_bd, lp->rx_bd_dma);
+		lp->rx_bd = NULL;
+	}
+
+	size = XEMACPS_SEND_BD_CNT * sizeof(struct xemacps_bd);
+	if (lp->tx_bd) {
+		dma_free_coherent(&lp->pdev->dev, size,
+			lp->tx_bd, lp->tx_bd_dma);
+		lp->tx_bd = NULL;
+	}
+}
+
+#endif
 
 /**
  * xemacps_descriptor_init - Allocate both TX and RX BDs
@@ -1527,6 +1943,7 @@ static int xemacps_descriptor_init(struct net_local *lp)
 		lp->rx_skb[i].skb = new_skb;
 		lp->rx_skb[i].mapping = new_skb_baddr;
 		lp->rx_skb[i].len = XEMACPS_RX_BUF_SIZE;
+
 	}
 
 	/*
@@ -1567,6 +1984,107 @@ err_out:
 	xemacps_descriptor_free(lp);
 	return -ENOMEM;
 }
+#ifdef NCTUSS
+static int nctuss_xemacps_descriptor_init(struct net_local *lp)
+{
+	int size;
+	struct sk_buff *new_skb;
+	u32 new_skb_baddr;
+	u32 i;
+	struct xemacps_bd *cur_p;
+	u32 regval;
+
+	lp->tx_skb = NULL;
+	lp->rx_skb = NULL;
+	lp->rx_bd = NULL;
+	lp->tx_bd = NULL;
+
+	/* Reset the indexes which are used for accessing the BDs */
+	lp->tx_bd_ci = 0;
+	lp->tx_bd_tail = 0;
+	lp->rx_bd_ci = 0;
+
+	size = XEMACPS_SEND_BD_CNT * sizeof(struct ring_info);
+	lp->tx_skb = kzalloc(size, GFP_KERNEL);
+	if (!lp->tx_skb)
+		goto err_out;
+	size = XEMACPS_RECV_BD_CNT * sizeof(struct ring_info);
+	lp->rx_skb = kzalloc(size, GFP_KERNEL);
+	if (!lp->rx_skb)
+		goto err_out;
+
+	/*
+	 * Set up RX buffer descriptors.
+	 */
+
+	size = XEMACPS_RECV_BD_CNT * sizeof(struct xemacps_bd);
+	lp->rx_bd = dma_alloc_coherent(&lp->pdev->dev, size,
+			&lp->rx_bd_dma, GFP_KERNEL);
+	if (!lp->rx_bd)
+		goto err_out;
+	dev_dbg(&lp->pdev->dev, "RX ring %d bytes at 0x%x mapped %p\n",
+			size, lp->rx_bd_dma, lp->rx_bd);
+
+	for (i = 0; i < XEMACPS_RECV_BD_CNT; i++) {
+		cur_p = &lp->rx_bd[i];
+
+		new_skb = nctuss_skb_pool_get();
+		new_skb_baddr = (u32)((struct nctuss_skb_wrapper *)(new_skb->nctuss_data))->data_phy;
+
+		/* set wrap bit for last BD */
+		regval = (new_skb_baddr & XEMACPS_RXBUF_ADD_MASK);
+		if (i == XEMACPS_RECV_BD_CNT - 1)
+			regval |= XEMACPS_RXBUF_WRAP_MASK;
+		cur_p->addr = regval;
+		cur_p->ctrl = 0;
+		wmb();
+
+		lp->rx_skb[i].skb = new_skb;
+		lp->rx_skb[i].mapping = new_skb_baddr;
+		lp->rx_skb[i].len = XEMACPS_RX_BUF_SIZE;
+	}
+
+	/*
+	 * Set up TX buffer descriptors.
+	 */
+
+	size = XEMACPS_SEND_BD_CNT * sizeof(struct xemacps_bd);
+	lp->tx_bd = dma_alloc_coherent(&lp->pdev->dev, size,
+			&lp->tx_bd_dma, GFP_KERNEL);
+	if (!lp->tx_bd)
+		goto err_out;
+	dev_dbg(&lp->pdev->dev, "TX ring %d bytes at 0x%x mapped %p\n",
+			size, lp->tx_bd_dma, lp->tx_bd);
+
+	for (i = 0; i < XEMACPS_SEND_BD_CNT; i++) {
+		cur_p = &lp->tx_bd[i];
+		/* set wrap bit for last BD */
+		cur_p->addr = 0;
+		regval = XEMACPS_TXBUF_USED_MASK;
+		if (i == XEMACPS_SEND_BD_CNT - 1)
+			regval |= XEMACPS_TXBUF_WRAP_MASK;
+		cur_p->ctrl = regval;
+	}
+	wmb();
+
+	lp->tx_bd_freecnt = XEMACPS_SEND_BD_CNT;
+
+	dev_dbg(&lp->pdev->dev,
+		"lp->tx_bd %p lp->tx_bd_dma %p lp->tx_skb %p\n",
+		lp->tx_bd, (void *)lp->tx_bd_dma, lp->tx_skb);
+	dev_dbg(&lp->pdev->dev,
+		"lp->rx_bd %p lp->rx_bd_dma %p lp->rx_skb %p\n",
+		lp->rx_bd, (void *)lp->rx_bd_dma, lp->rx_skb);
+
+	return 0;
+
+err_out:
+	xemacps_descriptor_free(lp);
+	return -ENOMEM;
+}
+
+#endif
+
 
 #ifdef CONFIG_XILINX_PS_EMAC_HWTSTAMP
 /*
@@ -1865,6 +2383,77 @@ err_free_rings:
 	return rc;
 }
 
+#ifdef NCTUSS
+static int nctuss_xemacps_open(struct net_device *ndev)
+{
+	struct net_local *lp = netdev_priv(ndev);
+	int rc;
+	int i;
+	struct sk_buff *new_skb;
+	u32 new_skb_baddr;
+	
+
+	dev_dbg(&lp->pdev->dev, "open\n");
+	if (!is_valid_ether_addr(ndev->dev_addr)) {
+		printk(KERN_ALERT "nctuss_xemacps_open: !is_valid_ether_addr(ndev->dev_addr)\n");
+		return  -EADDRNOTAVAIL;
+	}
+
+	rc = nctuss_xemacps_descriptor_init(lp);
+	if (rc) {
+		dev_err(&lp->pdev->dev,
+			"Unable to allocate DMA memory, rc %d\n", rc);
+		return rc;
+	}
+
+	rc = pm_runtime_get_sync(&lp->pdev->dev);
+	if (rc < 0) {
+		dev_err(&lp->pdev->dev,
+			"pm_runtime_get_sync() failed, rc %d\n", rc);
+		goto err_free_rings;
+	}
+
+	xemacps_init_hw(lp);
+	rc = xemacps_mii_probe(ndev);
+	if (rc != 0) {
+		dev_err(&lp->pdev->dev,
+			"%s mii_probe fail.\n", lp->mii_bus->name);
+		if (rc == (-2)) {
+			mdiobus_unregister(lp->mii_bus);
+			kfree(lp->mii_bus->irq);
+			mdiobus_free(lp->mii_bus);
+		}
+		rc = -ENXIO;
+		goto err_pm_put;
+	}
+/*
+	setup_timer(&(lp->gen_purpose_timer), xemacps_gen_purpose_timerhandler,
+							(unsigned long)lp);
+	mod_timer(&(lp->gen_purpose_timer),
+		jiffies + msecs_to_jiffies(XEAMCPS_GEN_PURPOSE_TIMER_LOAD));
+
+	napi_enable(&lp->napi);
+	netif_carrier_on(ndev);
+	netif_start_queue(ndev);
+	tasklet_enable(&lp->tx_bdreclaim_tasklet);
+*/
+
+	// Allocate & dma map tx sk_buffs
+	// these tx ring skbs will be released in xemacps_clean_rings()
+	
+	return 0;
+
+err_pm_put:
+	xemacps_reset_hw(lp);
+	pm_runtime_put(&lp->pdev->dev);
+err_free_rings:
+	xemacps_descriptor_free(lp);
+
+	return rc;
+}
+
+#endif
+
 /**
  * xemacps_close - disable a network interface
  * @ndev: network interface device structure
@@ -1896,6 +2485,31 @@ static int xemacps_close(struct net_device *ndev)
 
 	return 0;
 }
+
+#ifdef NCTUSS
+static int nctuss_xemacps_close(struct net_device *ndev)
+{
+	struct net_local *lp = netdev_priv(ndev);
+
+//	del_timer_sync(&(lp->gen_purpose_timer));
+//	netif_stop_queue(ndev);
+//	napi_disable(&lp->napi);
+//	tasklet_disable(&lp->tx_bdreclaim_tasklet);
+//	netif_carrier_off(ndev);
+
+	if (lp->phy_dev)
+		phy_disconnect(lp->phy_dev);
+	if (lp->gmii2rgmii_phy_node)
+		phy_disconnect(lp->gmii2rgmii_phy_dev);
+	xemacps_reset_hw(lp);
+	mdelay(500);
+	nctuss_xemacps_descriptor_free(lp);
+
+	pm_runtime_put(&lp->pdev->dev);
+
+	return 0;
+}
+#endif
 
 /**
  * xemacps_reinit_for_txtimeout - work queue scheduled for the tx timeout
@@ -2042,6 +2656,7 @@ static int xemacps_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	frag = &skb_shinfo(skb)->frags[0];
 
 	for (i = 0; i < nr_frags; i++) {
+
 		if (i == 0) {
 			len = skb_headlen(skb);
 			mapping = dma_map_single(&lp->pdev->dev, skb->data,
@@ -2079,6 +2694,7 @@ static int xemacps_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	}
 	wmb();
 
+
 	/* commit first buffer to hardware -- do this after
 	 * committing the other buffers to avoid an underrun */
 	cur_p = &lp->tx_bd[bd_tail];
@@ -2094,10 +2710,146 @@ static int xemacps_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	spin_unlock_irqrestore(&lp->nwctrlreg_lock, flags);
 
 	spin_unlock_bh(&lp->tx_lock);
+
 	ndev->trans_start = jiffies;
 	return 0;
 }
 
+#ifdef NCTUSS
+/*
+Get the next sk_buff in tx queue that we can use.
+*/
+static struct sk_buff* nctuss_xemacps_start_xmit_get_next_skb_buff(struct net_device *ndev)
+{
+	return nctuss_skb_pool_get();
+/*
+	struct net_local *lp = netdev_priv(ndev);
+
+	struct sk_buff *skb;
+	unsigned int size;
+	struct skb_shared_info *shinfo;
+
+	size = SKB_DATA_ALIGN(XEMACPS_RX_BUF_SIZE);
+		
+	if(lp->tx_bd_freecnt < 1) {
+		return NULL;
+	}
+	else {
+		*lp->tx_skb[lp->tx_bd_tail].skb = lp->tx_skb[lp->tx_bd_tail].skb_clone;
+
+		skb = lp->tx_skb[lp->tx_bd_tail].skb;
+
+		return skb;
+	}
+*/
+}
+EXPORT_SYMBOL(nctuss_xemacps_start_xmit_get_next_skb_buff);
+
+/*
+Our version of start_xmit. No locking is needed. And do NOT enable irq or bh.
+*/
+static int nctuss_xemacps_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+{
+	struct net_local *lp = netdev_priv(ndev);
+	dma_addr_t  mapping;
+	unsigned int nr_frags, len;
+	int i, j;
+	u32 regval;
+	void       *virt_addr;
+	skb_frag_t *frag;
+	struct xemacps_bd *cur_p;
+	unsigned long flags;
+	u32 bd_tail;
+	struct sk_buff *skb_clone;
+
+	////xemacps_resetrx_for_no_rxdata(lp);
+
+
+	nr_frags = skb_shinfo(skb)->nr_frags + 1;
+	////spin_lock_bh(&lp->tx_lock);
+
+/*
+	if (nr_frags > lp->tx_bd_freecnt) {
+		netif_stop_queue(ndev);
+		////spin_unlock_bh(&lp->tx_lock);
+		return NETDEV_TX_BUSY;
+	}
+*/
+	if(xemacps_clear_csum(skb,ndev)) {
+		////spin_unlock_bh(&lp->tx_lock);
+		//kfree(skb);
+		printk(KERN_ALERT "nctuss_xemacps_start_xmit: xemacps_clear_csum!!!\n");
+		return NETDEV_TX_OK;
+	}
+
+	bd_tail = lp->tx_bd_tail;
+	cur_p = &lp->tx_bd[bd_tail];
+	lp->tx_bd_freecnt -= nr_frags;
+	frag = &skb_shinfo(skb)->frags[0];
+	
+	if(nr_frags > 1) {
+		printk(KERN_ALERT "nctuss_xemacps_start_xmit: nr_frags > 1 (=%d)\n", nr_frags);
+	}
+
+	for (i = 0; i < nr_frags; i++) {
+
+		//printk(KERN_ALERT "nctuss_xemacps_start_xmit -1 skb=%u\n", skb);
+		len = skb_headlen(skb);
+		//printk(KERN_ALERT "nctuss_xemacps_start_xmit -2\n", skb);
+
+		struct nctuss_skb_wrapper *skbw = (struct nctuss_skb_wrapper *)(skb->nctuss_data);
+		//printk(KERN_ALERT "nctuss_xemacps_start_xmit -3\n", skb);
+		mapping = ((u32)skbw->data_phy) + (skb->data - skbw->skb_clone.data);
+		//printk(KERN_ALERT "nctuss_xemacps_start_xmit -4\n", skb);
+
+		lp->tx_skb[lp->tx_bd_tail].skb = skb;
+		lp->tx_skb[lp->tx_bd_tail].mapping = mapping;
+		lp->tx_skb[lp->tx_bd_tail].len = len;
+		//printk(KERN_ALERT "nctuss_xemacps_start_xmit -5\n", skb);
+
+		cur_p->addr = mapping;
+
+		/* preserve critical status bits */
+		regval = cur_p->ctrl;
+		regval &= (XEMACPS_TXBUF_USED_MASK | XEMACPS_TXBUF_WRAP_MASK);
+		/* update length field */
+		regval |= ((regval & ~XEMACPS_TXBUF_LEN_MASK) | len);
+		/* commit second to last buffer to hardware */
+		if (i != 0)
+			regval &= ~XEMACPS_TXBUF_USED_MASK;
+		/* last fragment of this packet? */
+		if (i == (nr_frags - 1))
+			regval |= XEMACPS_TXBUF_LAST_MASK;
+		cur_p->ctrl = regval;
+
+		lp->tx_bd_tail++;
+		lp->tx_bd_tail = lp->tx_bd_tail % XEMACPS_SEND_BD_CNT;
+		cur_p = &(lp->tx_bd[lp->tx_bd_tail]);
+	}
+	wmb();
+
+
+	/* commit first buffer to hardware -- do this after
+	 * committing the other buffers to avoid an underrun */
+	cur_p = &lp->tx_bd[bd_tail];
+	regval = cur_p->ctrl;
+	regval &= ~XEMACPS_TXBUF_USED_MASK;
+	cur_p->ctrl = regval;
+	wmb();
+
+	////spin_lock_irqsave(&lp->nwctrlreg_lock, flags);
+	regval = xemacps_read(lp->baseaddr, XEMACPS_NWCTRL_OFFSET);
+	xemacps_write(lp->baseaddr, XEMACPS_NWCTRL_OFFSET,
+			(regval | XEMACPS_NWCTRL_STARTTX_MASK));
+	////spin_unlock_irqrestore(&lp->nwctrlreg_lock, flags);
+
+	////spin_unlock_bh(&lp->tx_lock);
+
+	ndev->trans_start = jiffies;
+	return 0;
+}
+
+#endif
 /*
  * Get the MAC Address bit from the specified position
  */
@@ -2914,6 +3666,378 @@ static struct platform_driver xemacps_driver = {
 		.pm = XEMACPS_PM,
 	},
 };
+
+
+#ifdef NCTUSS
+
+static void nctuss_change_emacps_receive_skb_hook(void *func)
+{
+	unsigned long flags;
+	local_irq_save(flags);
+
+	nctuss_emacps_receive_skb_hook = func;
+
+	local_irq_restore(flags);
+}
+EXPORT_SYMBOL(nctuss_change_emacps_receive_skb_hook);
+
+static int nctuss_my_xemacps_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+{
+	printk(KERN_ALERT "!!!! nctuss_my_xemacps_start_xmit\n");
+	kfree(skb);
+	return NETDEV_TX_OK;
+}
+
+#define NCTUSS_SKB_SIZE (2048 + NET_SKB_PAD)
+static struct sk_buff * nctuss_alloc_skb(char *address, int *size_used)
+{
+	//REF: skbuff.c
+	// allocate a skb at address
+	int size;
+	u8 *data;
+	struct skb_shared_info *shinfo;
+	
+	struct sk_buff *skb = (struct sk_buff *)address;
+	memset(skb, 0, sizeof(struct sk_buff));
+	address += SKB_DATA_ALIGN(sizeof(struct sk_buff));
+
+	data = address;
+	
+	size = SKB_DATA_ALIGN(NCTUSS_SKB_SIZE);
+	size += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	*size_used = size;
+	address += size;
+
+	size = SKB_WITH_OVERHEAD(size);
+
+	skb->truesize = SKB_TRUESIZE(size);
+	skb->pfmemalloc = false;
+	atomic_set(&skb->users, 1);
+	skb->head = data;
+	skb->data = data;
+	skb_reset_tail_pointer(skb);
+	skb->end = skb->tail + size;
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+	skb->mac_header = ~0U;
+	skb->transport_header = ~0U;
+#endif
+
+	shinfo = skb_shinfo(skb);
+	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+	atomic_set(&shinfo->dataref, 1);
+	kmemcheck_annotate_variable(shinfo->destructor_arg);
+
+	skb_reserve(skb, NET_SKB_PAD);
+	
+	return skb;
+
+}
+
+static void nctuss_takeover_emacps(struct net_device *ndev, void *func, char *memory_buffer_virt, char *memory_buffer_phy)
+{
+	/* We will swap skb_buff.data to memory_buffer position. This memory should not be cached... */
+
+	int i;
+	struct sk_buff *new_skb;
+	int size_used;
+
+	INIT_LIST_HEAD(&nctuss_skb_free_list);
+	
+	for(i=0; i<NCTUSS_SKB_POOL_SIZE; i++) {
+
+#if 1
+		new_skb = nctuss_alloc_skb(memory_buffer_virt, &size_used);
+
+		nctuss_skb_pool[i].data_phy = memory_buffer_phy + (new_skb->data - (unsigned char *)new_skb);
+		nctuss_skb_pool[i].data_virt = new_skb->data;
+
+		memory_buffer_phy += size_used;
+		memory_buffer_virt += size_used;
+#else
+		new_skb = netdev_alloc_skb(ndev, XEMACPS_RX_BUF_SIZE);
+		if (new_skb == NULL) {
+			dev_err(&ndev->dev, "alloc_skb error %d\n", i);
+			// TODO: error handling
+		}
+		
+		nctuss_skb_pool[i].data_phy = memory_buffer_phy;
+		nctuss_skb_pool[i].data_virt = memory_buffer_virt;
+		
+		memory_buffer_phy += 2048;
+		memory_buffer_virt += 2048;	
+#endif
+
+
+
+		nctuss_skb_pool[i].ori_skb_data = new_skb->data;
+		nctuss_skb_pool[i].skb = new_skb;
+		new_skb->data = nctuss_skb_pool[i].data_virt;
+		new_skb->nctuss_data = &(nctuss_skb_pool[i]);
+
+		nctuss_skb_pool[i].skb_clone = *new_skb;
+
+		list_add(&nctuss_skb_pool[i].list, &nctuss_skb_free_list);
+	}
+	
+	disable_irq(ndev->irq);
+	nctuss_xemacps_open(ndev);
+	
+	nctuss_change_emacps_receive_skb_hook(func);
+
+	return;
+
+
+}
+EXPORT_SYMBOL(nctuss_takeover_emacps);
+static void xemacps_gen_purpose_timerhandler(unsigned long data);
+static void nctuss_restore_emacps(struct net_device *ndev)
+{
+	nctuss_xemacps_close(ndev);
+
+	// TODO: free skbs...
+	
+	nctuss_change_emacps_receive_skb_hook(NULL);
+	enable_irq(ndev->irq);
+	
+	return;
+
+}
+EXPORT_SYMBOL(nctuss_restore_emacps);
+
+static int xemacps_rx(struct net_local *lp, int budget);
+static void xemacps_tx_poll(unsigned long data);
+static void xemacps_tx_poll(unsigned long data);
+static void nctuss_xemacps_tx_poll(unsigned long data);
+#if 1
+static void nctuss_poll_emacps(struct net_device *ndev)
+{
+	struct net_local *lp = netdev_priv(ndev);
+	u32 regisr;
+	u32 regctrl;
+	u32 regval;
+
+	//xemacps_resetrx_for_no_rxdata(lp);
+
+	regisr = xemacps_read(lp->baseaddr, XEMACPS_ISR_OFFSET);
+	if (unlikely(!regisr))
+		return IRQ_NONE;
+
+	xemacps_write(lp->baseaddr, XEMACPS_ISR_OFFSET, regisr);
+
+	while (regisr) {
+		if (regisr & (XEMACPS_IXR_TXCOMPL_MASK |
+				XEMACPS_IXR_TX_ERR_MASK)) {
+			////tasklet_schedule(&lp->tx_bdreclaim_tasklet);			
+			nctuss_xemacps_tx_poll(ndev);
+		}
+
+		if (regisr & XEMACPS_IXR_RXUSED_MASK) {
+			////spin_lock(&lp->nwctrlreg_lock);
+			regctrl = xemacps_read(lp->baseaddr,
+					XEMACPS_NWCTRL_OFFSET);
+			regctrl |= XEMACPS_NWCTRL_FLUSH_DPRAM_MASK;
+			xemacps_write(lp->baseaddr,
+					XEMACPS_NWCTRL_OFFSET, regctrl);
+			////spin_unlock(&lp->nwctrlreg_lock);
+		}
+
+		if (regisr & XEMACPS_IXR_FRAMERX_MASK) {
+			xemacps_write(lp->baseaddr,
+				XEMACPS_IDR_OFFSET, XEMACPS_IXR_FRAMERX_MASK);
+			////napi_schedule(&lp->napi);
+
+			regval = xemacps_read(lp->baseaddr, XEMACPS_RXSR_OFFSET);
+			xemacps_write(lp->baseaddr, XEMACPS_RXSR_OFFSET, regval);
+			if (regval & XEMACPS_RXSR_HRESPNOK_MASK)
+				dev_err(&lp->pdev->dev, "RX error 0x%x\n", regval);
+
+			nctuss_xemacps_rx(lp, 128);
+
+			xemacps_write(lp->baseaddr,	XEMACPS_IER_OFFSET, XEMACPS_IXR_FRAMERX_MASK);
+		}
+		regisr = xemacps_read(lp->baseaddr, XEMACPS_ISR_OFFSET);
+		xemacps_write(lp->baseaddr, XEMACPS_ISR_OFFSET, regisr);
+	}
+
+}
+#else
+static void nctuss_poll_emacps(struct net_device *ndev)
+{
+
+	struct net_local *lp = netdev_priv(ndev);
+	nctuss_xemacps_rx(lp, 1);
+	nctuss_xemacps_tx_poll(ndev);
+
+	////return;
+
+	u32 regisr;
+	u32 regctrl;
+	u32 regval;
+
+	regisr = xemacps_read(lp->baseaddr, XEMACPS_ISR_OFFSET);
+	if (likely(!regisr))
+		return;
+
+	xemacps_write(lp->baseaddr, XEMACPS_ISR_OFFSET, regisr);
+
+	while (regisr) {
+		if (regisr & (XEMACPS_IXR_TXCOMPL_MASK |
+				XEMACPS_IXR_TX_ERR_MASK)) {
+			//printk(KERN_ALERT "nctuss_poll_emacps: calling xemacps_tx_poll\n");
+			nctuss_xemacps_tx_poll(ndev);
+			////tasklet_schedule(&lp->tx_bdreclaim_tasklet);
+		}
+
+		if (regisr & XEMACPS_IXR_RXUSED_MASK) {
+			////spin_lock(&lp->nwctrlreg_lock);
+			regctrl = xemacps_read(lp->baseaddr,
+					XEMACPS_NWCTRL_OFFSET);
+			regctrl |= XEMACPS_NWCTRL_FLUSH_DPRAM_MASK;
+			xemacps_write(lp->baseaddr,
+					XEMACPS_NWCTRL_OFFSET, regctrl);
+			////spin_unlock(&lp->nwctrlreg_lock);
+		}
+
+		if (regisr & XEMACPS_IXR_FRAMERX_MASK) {
+			// do not disable interrupt
+			//xemacps_write(lp->baseaddr,
+			//	XEMACPS_IDR_OFFSET, XEMACPS_IXR_FRAMERX_MASK);
+			
+			////napi_schedule(&lp->napi);
+			
+			regval = xemacps_read(lp->baseaddr, XEMACPS_RXSR_OFFSET);
+			xemacps_write(lp->baseaddr, XEMACPS_RXSR_OFFSET, regval);
+			if (regval & XEMACPS_RXSR_HRESPNOK_MASK)
+				dev_err(&lp->pdev->dev, "RX error 0x%x\n", regval);
+		}
+		regisr = xemacps_read(lp->baseaddr, XEMACPS_ISR_OFFSET);
+		xemacps_write(lp->baseaddr, XEMACPS_ISR_OFFSET, regisr);
+	}
+
+
+}
+#endif
+EXPORT_SYMBOL(nctuss_poll_emacps);
+
+struct nctuss_netpoll {
+	struct net_device *dev;
+	__be32 local_ip, remote_ip;
+	u16 local_port, remote_port;
+	unsigned char local_mac[6], remote_mac[6];
+};
+
+static int nctuss_xemacps_start_xmit(struct sk_buff *skb, struct net_device *ndev);
+
+static void nctuss_xemacps_send_skb(struct sk_buff *skb, struct net_device *ndev)
+{
+	nctuss_xemacps_start_xmit(skb, ndev);
+}
+EXPORT_SYMBOL(nctuss_xemacps_send_skb);
+
+
+
+static void nctuss_send_udp_emacps(struct nctuss_netpoll *nn, const char *msg, int len)
+{
+	int total_len, eth_len, ip_len, udp_len;
+	struct sk_buff *skb;
+	struct udphdr *udph;
+	struct iphdr *iph;
+	struct ethhdr *eth;
+	netdev_tx_t tx_status;
+
+
+	// does this help to get rid of the hang problem...?
+	struct net_local *lp = netdev_priv(nn->dev);
+	//nctuss_xemacps_tx_poll(nn->dev);
+	//while(nctuss_xemacps_rx(lp, 1)>0);
+	
+
+
+	udp_len = len + sizeof(*udph);
+	ip_len = eth_len = udp_len + sizeof(*iph);
+	total_len = eth_len + ETH_HLEN + NET_IP_ALIGN;
+
+	////skb = find_skb(np, total_len, total_len - len);
+	//skb = alloc_skb(total_len, GFP_ATOMIC);
+	skb = nctuss_xemacps_start_xmit_get_next_skb_buff(nn->dev);
+	if (!skb) {
+		printk(KERN_ALERT "nctuss_send_udp_emacps: alloc_skb failed\n");
+		return;
+	}
+
+	skb_reserve(skb, total_len - len);
+
+
+	skb_copy_to_linear_data(skb, msg, len);
+	skb->len += len;
+
+	skb_push(skb, sizeof(*udph));
+	skb_reset_transport_header(skb);
+	udph = udp_hdr(skb);
+	udph->source = htons(nn->local_port);
+	udph->dest = htons(nn->remote_port);
+	udph->len = htons(udp_len);
+	udph->check = 0;
+	udph->check = csum_tcpudp_magic(nn->local_ip,
+					nn->remote_ip,
+					udp_len, IPPROTO_UDP,
+					csum_partial(udph, udp_len, 0));
+	if (udph->check == 0)
+		udph->check = CSUM_MANGLED_0;
+
+	skb_push(skb, sizeof(*iph));
+	skb_reset_network_header(skb);
+	iph = ip_hdr(skb);
+
+	/* iph->version = 4; iph->ihl = 5; */
+	put_unaligned(0x45, (unsigned char *)iph);
+	iph->tos	  = 0;
+	put_unaligned(htons(ip_len), &(iph->tot_len));
+	iph->id 	  = 0;
+	iph->frag_off = 0;
+	iph->ttl	  = 64;
+	iph->protocol = IPPROTO_UDP;
+	iph->check	  = 0;
+	put_unaligned(nn->local_ip, &(iph->saddr));
+	put_unaligned(nn->remote_ip, &(iph->daddr));
+	iph->check	  = ip_fast_csum((unsigned char *)iph, iph->ihl);
+
+	eth = (struct ethhdr *) skb_push(skb, ETH_HLEN);
+	skb_reset_mac_header(skb);
+	skb->protocol = eth->h_proto = htons(ETH_P_IP);
+	//memcpy(eth->h_source, nn->dev->dev_addr, ETH_ALEN);
+	memcpy(eth->h_source, nn->local_mac, ETH_ALEN);
+	memcpy(eth->h_dest, nn->remote_mac, ETH_ALEN);
+
+	skb->dev = nn->dev;
+
+	////netpoll_send_skb(np, skb);
+	//printk(KERN_ALERT "calling xemacps_start_xmit\n");
+	tx_status = nctuss_xemacps_start_xmit(skb, skb->dev);
+	//printk(KERN_ALERT "return from xemacps_start_xmit. tx_status=%d\n", tx_status);
+
+	if(tx_status!=NETDEV_TX_OK) {
+		printk(KERN_ALERT "nctuss_send_udp_emacps: nctuss_xemacps_start_xmit failed. (%d)\n", tx_status);
+	}
+}
+EXPORT_SYMBOL(nctuss_send_udp_emacps);
+
+/*
+static void nctuss_emacps_reset(struct net_device *ndev)
+{
+
+	struct net_local *lp = netdev_priv(ndev);
+
+	if (lp->phy_dev)
+		phy_stop(lp->phy_dev);
+
+	if (lp->phy_dev)
+		phy_start(lp->phy_dev);	
+}
+EXPORT_SYMBOL(nctuss_emacps_reset);
+*/
+#endif
+
 
 module_platform_driver(xemacps_driver);
 

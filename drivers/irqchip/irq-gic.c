@@ -49,6 +49,9 @@
 
 #include "irqchip.h"
 
+// NCTUSS
+//#define USE_NORMAL_WORLD_INTERRUPT
+
 union gic_base {
 	void __iomem *common_base;
 	void __percpu __iomem **percpu_base;
@@ -467,8 +470,68 @@ static void __cpuinit gic_cpu_init(struct gic_chip_data *gic)
 		writel_relaxed(0xa0a0a0a0, dist_base + GIC_DIST_PRI + i * 4 / 4);
 
 	writel_relaxed(0xf0, base + GIC_CPU_PRIMASK);
+	
+#ifdef USE_NORMAL_WORLD_INTERRUPT
+	writel_relaxed(7, base + GIC_CPU_CTRL);
+#else
 	writel_relaxed(1, base + GIC_CPU_CTRL);
+#endif
+
+#if 0 // NCTUSS
+	writel_relaxed(0x7, base + GIC_CPU_CTRL);
+	unsigned int cpu_ctrl;
+	cpu_ctrl = readl(base + GIC_CPU_CTRL);
+	printk(KERN_ALERT "!!! gic[%x] CPU Interface Control Register (ICCICR)(GIC_CPU_CTRL) = %x\n", gic, cpu_ctrl);
+	cpu_ctrl |= (0x1<<1 | 0x1 << 2);
+	//cpu_ctrl |= (0x1<<1);
+	writel_relaxed(cpu_ctrl, base + GIC_CPU_CTRL);
+	cpu_ctrl = readl(base + GIC_CPU_CTRL);
+	printk(KERN_ALERT "!!! gic[%x] CPU Interface Control Register (ICCICR)(GIC_CPU_CTRL) = %x\n", gic, cpu_ctrl);
+#endif 
 }
+
+/* NCTUSS */
+#if 0
+static unsigned long nctuss_gic_local_irq_save(void)
+{
+	unsigned long flags;
+	void __iomem *base = gic_data_cpu_base(&gic_data[0]);
+	flags = readl(base + GIC_CPU_PRIMASK);
+	writel(0x00, base + GIC_CPU_PRIMASK);
+
+	return flags;
+}
+static void nctuss_gic_local_irq_enable(void)
+{
+	void __iomem *base = gic_data_cpu_base(&gic_data[0]);
+	writel(0xf0, base + GIC_CPU_PRIMASK);
+}
+static void nctuss_gic_local_irq_disable(void)
+{
+	void __iomem *base = gic_data_cpu_base(&gic_data[0]);
+	writel(0x00, base + GIC_CPU_PRIMASK);
+}
+static unsigned long nctuss_gic_local_save_flags(void)
+{
+	unsigned long flags;
+	void __iomem *base = gic_data_cpu_base(&gic_data[0]);
+	flags = readl(base + GIC_CPU_PRIMASK);
+	return flags;
+}
+static void nctuss_gic_local_irq_restore(unsigned long flags)
+{
+	void __iomem *base = gic_data_cpu_base(&gic_data[0]);
+	writel(flags, base + GIC_CPU_PRIMASK);
+}
+static int nctuss_gic_irqs_disabled_flags(unsigned long flags)
+{
+	if(flags == 0x00)
+		return 1;
+	else
+		return 0;
+}
+#endif
+
 
 #ifdef CONFIG_CPU_PM
 /*
@@ -545,7 +608,12 @@ static void gic_dist_restore(unsigned int gic_nr)
 		writel_relaxed(gic_data[gic_nr].saved_spi_enable[i],
 			dist_base + GIC_DIST_ENABLE_SET + i * 4);
 
+#ifdef USE_NORMAL_WORLD_INTERRUPT
+	writel_relaxed(7, dist_base + GIC_DIST_CTRL);
+#else
 	writel_relaxed(1, dist_base + GIC_DIST_CTRL);
+#endif
+
 }
 
 static void gic_cpu_save(unsigned int gic_nr)
@@ -602,7 +670,11 @@ static void gic_cpu_restore(unsigned int gic_nr)
 		writel_relaxed(0xa0a0a0a0, dist_base + GIC_DIST_PRI + i * 4);
 
 	writel_relaxed(0xf0, cpu_base + GIC_CPU_PRIMASK);
+#ifdef USE_NORMAL_WORLD_INTERRUPT
+	writel_relaxed(7, cpu_base + GIC_CPU_CTRL);
+#else
 	writel_relaxed(1, cpu_base + GIC_CPU_CTRL);
+#endif
 }
 
 static int gic_notifier(struct notifier_block *self, unsigned long cmd,	void *v)
@@ -677,6 +749,7 @@ void gic_raise_softirq(const struct cpumask *mask, unsigned int irq)
 
 	/* this always happens on GIC0 */
 	writel_relaxed(map << 16 | irq, gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
+	//NCTUSS note: GIC_DIST_SOFTINT ==  Software Generated Interrupt Register (ICDSGIR)
 }
 EXPORT_SYMBOL(gic_raise_softirq);
 #endif
@@ -809,6 +882,17 @@ void __init gic_init_bases(unsigned int gic_nr, int irq_start,
 	 * The GIC only supports up to 1020 interrupt sources.
 	 */
 	gic_irqs = readl_relaxed(gic_data_dist_base(gic) + GIC_DIST_CTR) & 0x1f;
+	
+#ifdef USE_NORMAL_WORLD_INTERRUPT // NCTUSS
+	printk(KERN_ALERT "!!!! irq-gic: ICDICTR (GIC_DIST_CTR) = %x\n", readl_relaxed(gic_data_dist_base(gic) + GIC_DIST_CTR));
+
+	printk(KERN_ALERT "!!!! (GIC_DIST_CTRL) = %x\n", readl_relaxed(gic_data_dist_base(gic) + GIC_DIST_CTRL));
+
+	writel_relaxed(0xFFFFFFFF, gic_data_dist_base(gic) + NCTUSS_GIC_DIST_ICDISR0);
+	writel_relaxed(0xFFFFFFFF, gic_data_dist_base(gic) + NCTUSS_GIC_DIST_ICDISR0 + 4);
+	writel_relaxed(0xFFFFFFFF, gic_data_dist_base(gic) + NCTUSS_GIC_DIST_ICDISR0 + 8);
+#endif
+
 	gic_irqs = (gic_irqs + 1) * 32;
 	if (gic_irqs > 1020)
 		gic_irqs = 1020;

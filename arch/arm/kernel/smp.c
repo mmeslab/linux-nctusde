@@ -66,6 +66,7 @@ enum ipi_msg_type {
 	IPI_CALL_FUNC,
 	IPI_CALL_FUNC_SINGLE,
 	IPI_CPU_STOP,
+	IPI_NCTUSS_INVOKE_FUNC,
 };
 
 static DECLARE_COMPLETION(cpu_running);
@@ -461,6 +462,7 @@ struct ipi {
 };
 
 static void ipi_cpu_stop(void);
+static void ipi_nctuss_invoke_func(void); // NCTUSS
 
 static struct ipi ipi_types[NR_IPI] = {
 #define S(x, s, f)	[x].desc = s, [x].handler = f
@@ -474,6 +476,7 @@ static struct ipi ipi_types[NR_IPI] = {
 	S(IPI_CALL_FUNC_SINGLE, "Single function call interrupts",
 				generic_smp_call_function_single_interrupt),
 	S(IPI_CPU_STOP, "CPU stop interrupts", ipi_cpu_stop),
+	S(IPI_NCTUSS_INVOKE_FUNC, "NCTUSS invoke function interrupts", ipi_nctuss_invoke_func),
 };
 
 void show_ipi_list(struct seq_file *p, int prec)
@@ -680,6 +683,34 @@ void smp_send_stop(void)
 	if (num_online_cpus() > 1)
 		pr_warning("SMP: failed to stop secondary CPUs\n");
 }
+
+/*
+NCTUSS
+*/
+static void (*nctuss_smp_func) (void) = NULL;
+void nctuss_smp_invoke_function(void *func)
+{
+	struct cpumask mask;
+
+	nctuss_smp_func = func;
+
+	cpumask_copy(&mask, cpu_online_mask);
+	cpumask_clear_cpu(smp_processor_id(), &mask);
+	if (!cpumask_empty(&mask))
+		smp_cross_call(&mask, IPI_NCTUSS_INVOKE_FUNC);	
+}
+EXPORT_SYMBOL(nctuss_smp_invoke_function);
+
+static void ipi_nctuss_invoke_func(void)
+{
+	if(likely(nctuss_smp_func!=NULL)) {
+		nctuss_smp_func();
+	}
+	else {
+		printk(KERN_ALERT "In ipi_nctuss_invoke_func(), nctuss_smp_func == NULL\n");
+	}
+}
+
 
 /*
  * not supported here
